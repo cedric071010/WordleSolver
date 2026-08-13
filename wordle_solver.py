@@ -1,235 +1,300 @@
+"""Pure Wordle solving primitives and session state.
+
+The module has no user-interface or persistence side effects, so it can be
+safely imported by a desktop application or a test suite.
+"""
+
+from __future__ import annotations
+
 from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Mapping, Sequence
 
 
-known_green = {}
+WORD_LENGTH = 5
+MAX_ATTEMPTS = 6
 
-def reset_possible_words():
-    with open("valid_words.txt", "r") as valid_file:
-        words = valid_file.read()
-
-    with open("possible_words.txt", "w") as possible_file:
-        possible_file.write(words)
+ABSENT = "absent"
+PRESENT = "present"
+CORRECT = "correct"
+FEEDBACK_STATES = (ABSENT, PRESENT, CORRECT)
 
 
-def count_letters():
-    counts = Counter()
+def normalize_guess(value: str) -> str:
+    """Return a lowercase five-letter ASCII word.
 
-    with open("possible_words.txt", "r") as file:
-        words = [line.strip() for line in file if line.strip()]
+    ``ValueError`` is used for every invalid input so callers can present a
+    single, consistent validation message.
+    """
 
-    for word in words:
-        letter_count = Counter(word)
+    if not isinstance(value, str):
+        raise ValueError("guess must be exactly five ASCII letters")
+    value = value.strip()
+    if (
+        len(value) != WORD_LENGTH
+        or not value.isascii()
+        or not value.isalpha()
+    ):
+        raise ValueError("guess must be exactly five ASCII letters")
+    return value.lower()
 
-        for letter, amount in letter_count.items():
+
+@dataclass(frozen=True)
+class Attempt:
+    """One normalized guess and its five corresponding feedback states."""
+
+    guess: str
+    feedback: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "guess", normalize_guess(self.guess))
+        try:
+            feedback = tuple(self.feedback)
+        except TypeError as exc:
+            raise ValueError("feedback must contain exactly five states") from exc
+
+        if (
+            len(feedback) != WORD_LENGTH
+            or any(state not in FEEDBACK_STATES for state in feedback)
+        ):
+            raise ValueError(
+                "feedback must contain exactly five valid feedback states"
+            )
+        object.__setattr__(self, "feedback", feedback)
+
+
+def load_words(path: str | Path | None = None) -> tuple[str, ...]:
+    """Load unique candidate answers, preserving first-seen file order.
+
+    The bundled ``possible_words.txt`` contains the common answer pool.  A
+    caller can still pass ``valid_words.txt`` (or another file) explicitly
+    when it needs the broader accepted-guess dictionary.
+    """
+
+    word_path = Path(path) if path is not None else Path(__file__).with_name(
+        "possible_words.txt"
+    )
+    words: list[str] = []
+    seen: set[str] = set()
+
+    with word_path.open("r", encoding="utf-8") as word_file:
+        for line in word_file:
+            value = line.strip()
+            try:
+                word = normalize_guess(value)
+            except ValueError:
+                continue
+            if word not in seen:
+                seen.add(word)
+                words.append(word)
+
+    if not words:
+        raise ValueError(f"word list contains no valid five-letter words: {word_path}")
+    return tuple(words)
+
+
+def evaluate_guess(answer: str, guess: str) -> tuple[str, ...]:
+    """Return canonical Wordle feedback, including duplicate-letter handling."""
+
+    answer = normalize_guess(answer)
+    guess = normalize_guess(guess)
+    feedback = [ABSENT] * WORD_LENGTH
+    unmatched = Counter()
+
+    # Exact matches consume their answer positions before misplaced letters.
+    for index, (answer_letter, guess_letter) in enumerate(zip(answer, guess)):
+        if answer_letter == guess_letter:
+            feedback[index] = CORRECT
+        else:
+            unmatched[answer_letter] += 1
+
+    for index, guess_letter in enumerate(guess):
+        if feedback[index] == CORRECT:
+            continue
+        if unmatched[guess_letter] > 0:
+            feedback[index] = PRESENT
+            unmatched[guess_letter] -= 1
+
+    return tuple(feedback)
+
+
+def filter_candidates(
+    words: Iterable[str], attempts: Iterable[Attempt]
+) -> tuple[str, ...]:
+    """Keep candidates that reproduce all of the supplied observed feedback."""
+
+    observed = tuple(attempts)
+    if any(not isinstance(attempt, Attempt) for attempt in observed):
+        raise ValueError("attempts must contain Attempt instances")
+
+    candidates: list[str] = []
+    for value in words:
+        candidate = normalize_guess(value)
+        if all(
+            evaluate_guess(candidate, attempt.guess) == attempt.feedback
+            for attempt in observed
+        ):
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def count_letters(words: Iterable[str]) -> Counter[str]:
+    """Count per-word letter thresholds used by the original scoring scheme."""
+
+    counts: Counter[str] = Counter()
+    for value in words:
+        letter_counts = Counter(normalize_guess(value))
+        for letter, amount in letter_counts.items():
             counts[letter] += 1
-            if amount >= 2:
-                counts[f"{letter}2"] += 1
-            if amount >= 3:
-                counts[f"{letter}3"] += 1
-            if amount >= 4:
-                counts[f"{letter}4"] += 1
-            if amount >= 5:
-                counts[f"{letter}5"] += 1
-
+            for threshold in range(2, amount + 1):
+                counts[f"{letter}{threshold}"] += 1
     return counts
 
 
-def score_word(word, letter_data):
+def score_word(word: str, letter_data: Mapping[str, int]) -> int:
+    """Score a word from the supplied per-letter threshold counts."""
 
+    letter_counts = Counter(normalize_guess(word))
     score = 0
-    letter_count = Counter(word)
-
-    for letter, amount in letter_count.items():
-
-        score += letter_data[letter]
-        if amount >= 2:
-            score += letter_data[f"{letter}2"]
-        if amount >= 3:
-            score += letter_data[f"{letter}3"]
-        if amount >= 4:
-            score += letter_data[f"{letter}4"]
-        if amount >= 5:
-            score += letter_data[f"{letter}5"]
-
+    for letter, amount in letter_counts.items():
+        score += letter_data.get(letter, 0)
+        for threshold in range(2, amount + 1):
+            score += letter_data.get(f"{letter}{threshold}", 0)
     return score
 
 
-def get_letters_from_input(text):
-    text = text.replace(" ", "").lower()
-    return [char for char in text if char.isalpha()]
+def rank_words(words: Iterable[str], limit: int = 5) -> tuple[tuple[str, int], ...]:
+    """Rank by descending score, then alphabetically to break score ties."""
+
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise ValueError("limit must be a non-negative integer")
+
+    normalized = tuple(normalize_guess(word) for word in words)
+    letter_data = count_letters(normalized)
+    scored = [(word, score_word(word, letter_data)) for word in normalized]
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    return tuple(scored[:limit])
 
 
-def get_user_rules():
-    green = known_green.copy()
-    yellow = {}
-    gray = set()
+class WordleSession:
+    """In-memory state for one game-solving session."""
 
-    print("\n=== GREEN LETTERS ===")
+    def __init__(
+        self,
+        words: Iterable[str],
+        fallback_words: Iterable[str] | None = None,
+    ) -> None:
+        unique_words: list[str] = []
+        seen: set[str] = set()
+        for value in words:
+            word = normalize_guess(value)
+            if word not in seen:
+                seen.add(word)
+                unique_words.append(word)
+        if not unique_words:
+            raise ValueError("words must contain at least one valid word")
 
-    for i in range(5):
+        self._all_words = tuple(unique_words)
+        fallback: list[str] = []
+        fallback_seen = set(self._all_words)
+        for value in () if fallback_words is None else fallback_words:
+            word = normalize_guess(value)
+            if word not in fallback_seen:
+                fallback_seen.add(word)
+                fallback.append(word)
+        self._fallback_words = tuple(fallback)
+        self._remaining_words = self._all_words
+        self._attempts: list[Attempt] = []
+        self._using_fallback = False
 
-        if i in known_green:
-            print(f"Green at position {i + 1}: {known_green[i]} already known")
-            continue
+    @property
+    def all_words(self) -> tuple[str, ...]:
+        return self._all_words
 
-        while True:
-            letter = input(f"Green at position {i + 1}: ").strip().lower()
+    @property
+    def remaining_words(self) -> tuple[str, ...]:
+        return self._remaining_words
 
-            if not letter:
-                break
+    @property
+    def attempts(self) -> tuple[Attempt, ...]:
+        return tuple(self._attempts)
 
-            if len(letter) == 1 and letter.isalpha():
-                green[i] = letter
-                known_green[i] = letter
-                break
+    @property
+    def candidate_count(self) -> int:
+        return len(self._remaining_words)
 
-            print("Invalid. Enter one letter only, or press Enter.")
+    @property
+    def using_fallback(self) -> bool:
+        """Whether candidates come from the broader accepted-word corpus."""
 
-    print("\n=== YELLOW LETTERS ===")
+        return self._using_fallback
 
-    for i in range(5):
-        yellow[i] = []
+    @property
+    def attempt_number(self) -> int:
+        """Return the next 1-based board row, capped at ``MAX_ATTEMPTS``."""
 
-        text = input(f"Yellow at position {i + 1}: ").strip().lower()
+        return min(len(self._attempts) + 1, MAX_ATTEMPTS)
 
-        if text:
-            yellow[i] = get_letters_from_input(text)
+    @property
+    def solved(self) -> bool:
+        return bool(self._attempts) and all(
+            state == CORRECT for state in self._attempts[-1].feedback
+        )
 
-    print("\n=== GRAY LETTERS ===")
+    @property
+    def exhausted(self) -> bool:
+        return len(self._attempts) >= MAX_ATTEMPTS and not self.solved
 
-    gray_input = input("Gray letters: ").strip().lower()
+    @property
+    def is_over(self) -> bool:
+        return self.solved or self.exhausted
 
-    for letter in get_letters_from_input(gray_input):
-        gray.add(letter)
+    def submit(self, guess: str, feedback: Sequence[str]) -> Attempt:
+        """Record feedback and narrow the remaining candidates."""
 
-    return green, yellow, gray
+        if self.is_over:
+            raise RuntimeError("the session is already over")
+        attempt = Attempt(guess, tuple(feedback))
+        self._attempts.append(attempt)
+        self._remaining_words = filter_candidates(
+            self._remaining_words, (attempt,)
+        )
+        if not self._remaining_words and not self._using_fallback:
+            expanded = filter_candidates(self._fallback_words, self._attempts)
+            if expanded:
+                self._remaining_words = expanded
+                self._using_fallback = True
+        return attempt
 
+    def undo(self) -> Attempt | None:
+        """Remove the latest attempt and recompute candidates from all words."""
 
-def is_possible_word(word, green, yellow, gray):
+        if not self._attempts:
+            return None
+        attempt = self._attempts.pop()
+        self._recompute_candidates()
+        return attempt
 
-    word_count = Counter(word)
-    confirmed_count = Counter()
+    def reset(self) -> None:
+        """Restore the session to its initial state."""
 
-    for letter in green.values():
-        confirmed_count[letter] += 1
+        self._attempts.clear()
+        self._remaining_words = self._all_words
+        self._using_fallback = False
 
-    for letters in yellow.values():
-        for letter in letters:
-            confirmed_count[letter] += 1
+    def suggestions(self, limit: int = 5) -> tuple[tuple[str, int], ...]:
+        return rank_words(self._remaining_words, limit)
 
-    for position, letter in green.items():
-        if word[position] != letter:
-            return False
+    def _recompute_candidates(self) -> None:
+        """Rebuild candidates, expanding only when the common pool is empty."""
 
-    for position, letters in yellow.items():
-        for letter in letters:
-            if word[position] == letter:
-                return False
-
-    for letter, amount in confirmed_count.items():
-        if word_count[letter] < amount:
-            return False
-
-    for letter in gray:
-        if confirmed_count[letter] == 0:
-            if letter in word:
-                return False
-        else:
-            if word_count[letter] > confirmed_count[letter]:
-                return False
-
-    return True
-
-
-def update_possible_words():
-
-    green, yellow, gray = get_user_rules()
-
-    with open("possible_words.txt", "r") as file:
-        words = [line.strip().lower() for line in file if line.strip()]
-
-    possible_words = []
-
-    for word in words:
-        if is_possible_word(word, green, yellow, gray):
-            possible_words.append(word)
-
-    with open("possible_words.txt", "w") as file:
-        for word in possible_words:
-            file.write(word + "\n")
-
-    if len(possible_words) == 0:
-        print("\nWARNING: 0 possible words left.")
-
-    else:
-        print(f"\nPossible words left: {len(possible_words)}")
-
-    if len(possible_words) <= 25:
-        print(possible_words)
-
-    letter_data = count_letters()
-    """
-    print("\n=== LETTER COUNTS ===")
-    print(letter_data)
-    """
-    print("\n=== WORD SCORES ===")
-
-    scored_words = []
-
-    for word in possible_words:
-        score = score_word(word, letter_data)
-        scored_words.append((word, score))
-
-    scored_words.sort(key=lambda x: x[1], reverse=True)
-
-    for word, score in scored_words[:5]:
-        print(word, score)
-
-    if scored_words:
-        print(f"\nBEST WORD: {scored_words[0][0]}")
-
-
-if __name__ == "__main__":
-
-    reset_possible_words()
-
-    letter_data = count_letters()
-
-    with open("possible_words.txt", "r") as file:
-        words = [line.strip().lower() for line in file if line.strip()]
-
-    scored_words = []
-
-    for word in words:
-        score = score_word(word, letter_data)
-        scored_words.append((word, score))
-
-    scored_words.sort(key=lambda x: x[1], reverse=True)
-
-    print("\n=== STARTING BEST WORD ===")
-    print(scored_words[0][0], scored_words[0][1])
-
-    while True:
-    
-        update_possible_words()
-    
-        with open("possible_words.txt", "r") as file:
-            remaining_words = [
-                line.strip().lower()
-                for line in file
-                if line.strip()
-            ]
-
-        if len(remaining_words) == 1:
-            print(f"\nANSWER: {remaining_words[0]}")
-            break
-    
-        action = input("\nEnter r to reset, q to quit, anything else to continue: ").strip().lower()
-    
-        if action == "q":
-            break
-    
-        if action == "r":
-            reset_possible_words()
-            known_green.clear()
-            print("\nReset done.")
+        common = filter_candidates(self._all_words, self._attempts)
+        if common or not self._fallback_words:
+            self._remaining_words = common
+            self._using_fallback = False
+            return
+        self._remaining_words = filter_candidates(
+            self._fallback_words, self._attempts
+        )
+        self._using_fallback = bool(self._remaining_words)
